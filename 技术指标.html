@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>OKX K线 + EMA + MACD 可交互图 (HTML + JS)</title>
+    <style>
+        body {
+            font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+            margin: 12px;
+            background: #0f1724;
+            color: #e6eef8;
+        }
+
+        .controls {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        input,
+        select,
+        button {
+            padding: 6px 8px;
+            border-radius: 6px;
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            background: rgba(255, 255, 255, 0.02);
+            color: inherit;
+        }
+
+        #chart {
+            width: 100%;
+            height: 520px;
+        }
+
+        #macd {
+            width: 100%;
+            height: 160px;
+            margin-top: 8px;
+        }
+
+        .tooltip {
+            position: fixed;
+            right: 12px;
+            top: 80px;
+            padding: 12px;
+            border-radius: 6px;
+            background: rgba(3, 7, 18, 0.9);
+            color: #dbeafe;
+            font-size: 13px;
+            box-shadow: 0 6px 18px rgba(2, 6, 23, 0.6);
+            display: none;
+            z-index: 1000;
+            min-width: 220px;
+        }
+
+        .legend {
+            margin-left: 6px;
+            font-size: 13px;
+        }
+
+        footer {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #9fb0cc;
+        }
+    </style>
+</head>
+
+<body>
+    <h2>OKX K线 可视化（支持自选交易对、周期，带 EMA 与 MACD）</h2>
+    <div class="controls">
+        <label>交易对:
+            <input id="symbol" list="symbolList" placeholder="如：BTC-USDT、ETH-USDT" />
+            <datalist id="symbolList">
+                <option value="BTC-USDT" />
+                <option value="ETH-USDT" />
+                <option value="SOL-USDT" />
+                <option value="XRP-USDT" />
+                <option value="DOGE-USDT" />
+                <option value="ADA-USDT" />
+                <option value="LINK-USDT" />
+                <option value="DOT-USDT" />
+            </datalist>
+        </label>
+        <label>周期: <select id="interval">
+                <option value="1m">1m</option>
+                <option value="5m">5m</option>
+                <option value="15m">15m</option>
+                <option value="1h">1H</option>
+                <option value="4h">4H</option>
+                <option value="1D">1D</option>
+            </select></label>
+        <label>数据点: <input id="limit" type="number" value="300" style="width:86px" /></label>
+        <label>EMA 周期: <input id="emaPeriod" type="number" value="12" style="width:70px" /></label>
+        <button id="fetchBtn">获取并绘制</button>
+        <div class="legend" id="status"></div>
+    </div>
+
+    <div id="chart"></div>
+    <div id="macd"></div>
+    <div id="tooltip" class="tooltip"></div>
+    <footer>数据来源：OKX 公共 REST 接口（<code>/api/v5/market/candles</code>），适用于公共行情查询；仅做学习/展示用途。</footer>
+
+    <script src="https://unpkg.com/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script>
+        function calculateEMA(values, period) {
+            const k = 2 / (period + 1);
+            const ema = [];
+            if (!values.length) return ema;
+            const start = Math.min(period, values.length);
+            let sum = 0;
+            for (let i = 0; i < start; i++) sum += values[i];
+            let prev = sum / start;
+            ema[start - 1] = prev;
+            for (let i = start; i < values.length; i++) {
+                const v = values[i];
+                const cur = v * k + prev * (1 - k);
+                ema[i] = cur;
+                prev = cur;
+            }
+            for (let i = 0; i < start - 1; i++) ema[i] = null;
+            return ema;
+        }
+
+        function calculateMACD(closeValues, fast = 12, slow = 26, signal = 9) {
+            const emaFast = calculateEMA(closeValues, fast);
+            const emaSlow = calculateEMA(closeValues, slow);
+            const macdLine = closeValues.map((c, i) => (emaFast[i] != null && emaSlow[i] != null) ? (emaFast[i] - emaSlow[i]) : null);
+            const signalLine = calculateEMA(macdLine.map(v => v == null ? 0 : v), signal);
+            const hist = macdLine.map((m, i) => (m != null && signalLine[i] != null) ? (m - signalLine[i]) : null);
+            return { macdLine, signalLine, hist };
+        }
+
+        function transformOKXCandles(data) {
+            const candles = [];
+            for (const item of data) {
+                if (Array.isArray(item)) {
+                    const ts = Number(item[0]);
+                    const o = Number(item[1]);
+                    const h = Number(item[2]);
+                    const l = Number(item[3]);
+                    const c = Number(item[4]);
+                    candles.push({ time: Math.floor(ts / 1000), open: o, high: h, low: l, close: c });
+                } else if (item.o !== undefined) {
+                    const ts = Number(item.t || item.timestamp || item.time);
+                    candles.push({ time: Math.floor(ts / 1000), open: Number(item.o), high: Number(item.h), low: Number(item.l), close: Number(item.c) });
+                }
+            }
+            candles.sort((a, b) => a.time - b.time);
+            return candles;
+        }
+
+        const fetchBtn = document.getElementById('fetchBtn');
+        const status = document.getElementById('status');
+        const tooltip = document.getElementById('tooltip');
+        let chart, candleSeries, emaSeries, macdChart, macdHistogram, macdSignalSeries;
+        let macdMap = new Map();
+
+        function createCharts() {
+            const chartContainer = document.getElementById('chart');
+            chartContainer.innerHTML = '';
+            document.getElementById('macd').innerHTML = '';
+
+            chart = LightweightCharts.createChart(chartContainer, {
+                layout: { background: { color: '#071023' }, textColor: '#e6eef8' },
+                rightPriceScale: { borderColor: 'rgba(255,255,255,0.06)' },
+                timeScale: { borderColor: 'rgba(255,255,255,0.06)', timeVisible: true },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal }
+            });
+
+            candleSeries = chart.addCandlestickSeries({ upColor: '#26a69a', downColor: '#ef5350', borderVisible: false });
+            emaSeries = chart.addLineSeries({ lineWidth: 2, priceLineVisible: false });
+
+            macdChart = LightweightCharts.createChart(document.getElementById('macd'), {
+                layout: { background: { color: '#071023' }, textColor: '#e6eef8' },
+                rightPriceScale: { borderColor: 'rgba(255,255,255,0.06)' },
+                timeScale: { visible: false }
+            });
+
+            macdHistogram = macdChart.addHistogramSeries({ priceFormat: { type: 'price', precision: 6 }, priceScaleId: '', scaleMargins: { top: 0.4, bottom: 0 } });
+            macdSignalSeries = macdChart.addLineSeries({ lineWidth: 2 });
+
+            chart.subscribeCrosshairMove(param => {
+                // 如果没有时间，隐藏 tooltip
+                if (!param || !param.time) {
+                    tooltip.style.display = 'none';
+                    return;
+                }
+
+                // 使用 param.seriesData?.get(...)，避免报错
+                const candle = param.seriesData?.get?.(candleSeries) ?? null;
+                const emaVal = param.seriesData?.get?.(emaSeries) ?? null;
+                const macdPoint = macdMap.get(param.time);
+
+                if (!candle) {
+                    tooltip.style.display = 'none';
+                    return;
+                }
+
+                let html = `<div><b>${new Date(param.time * 1000).toLocaleString()}</b></div>`;
+                html += `<div>开盘: ${candle.open}</div>`;
+                html += `<div>收盘: ${candle.close}</div>`;
+                html += `<div>最高: ${candle.high}</div>`;
+                html += `<div>最低: ${candle.low}</div>`;
+                if (emaVal != null) html += `<div>EMA: ${emaVal.toFixed(6)}</div>`;
+                if (macdPoint) html += `<div>MACD: ${macdPoint.macd.toFixed(6)} Signal: ${macdPoint.signal.toFixed(6)} Hist: ${macdPoint.hist.toFixed(6)}</div>`;
+
+                tooltip.innerHTML = html;
+                tooltip.style.display = 'block';
+            });
+
+            chart.subscribeClick(() => { tooltip.style.display = 'none'; });
+        }
+
+        async function fetchAndRender() {
+            const symbol = document.getElementById('symbol').value.trim() || 'BTC-USDT';
+            const interval = document.getElementById('interval').value;
+            const limit = Number(document.getElementById('limit').value) || 200;
+            const emaPeriod = Number(document.getElementById('emaPeriod').value) || 12;
+            status.textContent = '请求中...';
+
+            try {
+                const url = `https://www.okx.com/api/v5/market/candles?instId=${encodeURIComponent(symbol)}&bar=${encodeURIComponent(interval)}&limit=${limit}`;
+                const resp = await fetch(url);
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const json = await resp.json();
+                const raw = json.data || json.result || json;
+                const candles = transformOKXCandles(raw || []);
+                if (!candles.length) throw new Error('未返回数据或数据解析失败');
+
+                const seriesData = candles.map(c => ({ time: c.time, open: c.open, high: c.high, low: c.low, close: c.close }));
+                const closes = candles.map(c => c.close);
+                const emaValues = calculateEMA(closes, emaPeriod);
+                const emaData = emaValues.map((v, i) => ({ time: candles[i].time, value: v })).filter(x => x.value !== undefined);
+
+                const macd = calculateMACD(closes);
+                macdMap = new Map();
+                for (let i = 0; i < candles.length; i++) {
+                    macdMap.set(candles[i].time, { macd: macd.macdLine[i], signal: macd.signalLine[i], hist: macd.hist[i] });
+                }
+
+                createCharts();
+                candleSeries.setData(seriesData);
+                emaSeries.setData(emaData);
+                macdHistogram.setData(candles.map((c, i) => ({ time: c.time, value: macd.hist[i] })));
+                macdSignalSeries.setData(candles.map((c, i) => ({ time: c.time, value: macd.signalLine[i] })));
+
+                status.textContent = `绘制完成 — ${symbol} ${interval} 共 ${candles.length} 条`;
+            } catch (e) {
+                console.error(e);
+                status.textContent = '错误: ' + e.message;
+            }
+        }
+
+        fetchBtn.addEventListener('click', fetchAndRender);
+        fetchAndRender();
+    </script>
+</body>
+
+</html>
